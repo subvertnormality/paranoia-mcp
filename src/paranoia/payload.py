@@ -352,8 +352,9 @@ def find_tests_for(repo: Path, rel_path: str, all_files: list[str]) -> list[str]
     if not stem or stem.startswith("test_") or stem.endswith("_test") or stem == "__init__":
         return []
     # For generic stems, require a second signal: a parent dir name in the test filename.
+    # Skip this extra gate when the file lives at the repo root (no parent to discriminate on).
     parent_parts = {p for p in Path(rel_path).parent.parts if p not in {".", ""}}
-    require_parent_match = stem in GENERIC_STEMS
+    require_parent_match = stem in GENERIC_STEMS and bool(parent_parts)
     hits: list[str] = []
     for f in all_files:
         if f == rel_path or not f.endswith(".py"):

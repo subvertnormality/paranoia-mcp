@@ -214,12 +214,28 @@ def _parse_scout_response(raw: str) -> list[str]:
 def _gpt(system_prompt: str, user_content: str) -> str:
     client = OpenAI()
     model = os.environ.get("PARANOIA_MODEL", "gpt-5.4")
-    resp = client.responses.create(
-        model=model,
-        instructions=system_prompt,
-        input=user_content,
-    )
-    return resp.output_text or ""
+    try:
+        resp = client.responses.create(
+            model=model,
+            instructions=system_prompt,
+            input=user_content,
+        )
+    except Exception as exc:
+        return f"[paranoia error] OpenAI call failed: {type(exc).__name__}: {exc}"
+    return resp.output_text or "[paranoia error] OpenAI returned empty response"
+
+
+def _validate_token_budget(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"token_budget must be an integer, got {type(value).__name__}")
+    if value < 1000:
+        raise ValueError(f"token_budget must be >= 1000, got {value}")
+    if value > MODEL_CONTEXT_STANDARD:
+        raise ValueError(
+            f"token_budget {value} exceeds gpt-5.4 standard context ({MODEL_CONTEXT_STANDARD}). "
+            f"Using the 1M extended tier requires extra API params not configured here."
+        )
+    return value
 
 
 @server.call_tool()
@@ -229,10 +245,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         base_ref = arguments.get("base_ref", "main")
         head_ref = arguments.get("head_ref", "HEAD")
         extra_files = list(arguments.get("extra_files", []))
-        token_budget = arguments.get("token_budget", DEFAULT_INPUT_BUDGET)
+        token_budget = _validate_token_budget(
+            arguments.get("token_budget", DEFAULT_INPUT_BUDGET)
+        )
 
         if arguments.get("deep"):
-            scout_payload = build_scout_payload(repo_path, base_ref, head_ref)
+            try:
+                scout_payload = build_scout_payload(repo_path, base_ref, head_ref)
+            except Exception as exc:
+                return [TextContent(
+                    type="text",
+                    text=f"[paranoia error] scout payload build failed: {type(exc).__name__}: {exc}",
+                )]
             scout_raw = await asyncio.to_thread(_gpt, SCOUT_SYSTEM_PROMPT, scout_payload)
             scout_paths = _parse_scout_response(scout_raw)
             existing = {e["path"] for e in extra_files}
@@ -240,13 +264,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if p not in existing:
                     extra_files.append({"path": p, "reason": "scouting pass"})
 
-        payload = build_payload(
-            repo_path=repo_path,
-            base_ref=base_ref,
-            head_ref=head_ref,
-            extra_files=extra_files,
-            token_budget=token_budget,
-        )
+        try:
+            payload = build_payload(
+                repo_path=repo_path,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                extra_files=extra_files,
+                token_budget=token_budget,
+            )
+        except Exception as exc:
+            return [TextContent(
+                type="text",
+                text=f"[paranoia error] payload build failed: {type(exc).__name__}: {exc}",
+            )]
 
         header_sections: list[str] = [
             "Review the following branch diff. Produce the five-section output defined in your instructions. "
@@ -266,11 +296,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "critique_plan":
         plan_text = arguments.get("plan_text")
         plan_path = arguments.get("plan_path")
+        if plan_text and plan_path:
+            raise ValueError(
+                "critique_plan requires exactly one of plan_text or plan_path, not both"
+            )
         if not plan_text and not plan_path:
             raise ValueError("critique_plan requires plan_text or plan_path")
-        if plan_path and not plan_text:
+        if plan_path:
             from pathlib import Path
-            plan_text = Path(plan_path).read_text()
+            try:
+                plan_text = Path(plan_path).read_text(encoding="utf-8", errors="replace")
+            except (FileNotFoundError, IsADirectoryError, PermissionError, OSError) as exc:
+                return [TextContent(
+                    type="text",
+                    text=f"[paranoia error] cannot read plan_path: {type(exc).__name__}: {exc}",
+                )]
         user_content = f"=== PLAN ===\n{plan_text}"
         if ctx := arguments.get("context"):
             user_content = f"=== CONTEXT ===\n{ctx}\n\n{user_content}"
