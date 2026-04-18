@@ -52,28 +52,60 @@ def extract_changed_symbols(diff_text: str) -> list[str]:
     return sorted(s for s in found if not s.startswith("_"))
 
 
-def parse_imports(py_source: str, repo_root: Path) -> list[str]:
+_PACKAGE_ROOT_CANDIDATES = ("", "src")
+
+
+def parse_imports(
+    py_source: str, repo_root: Path, importing_rel_path: str | None = None
+) -> list[str]:
     try:
         tree = ast.parse(py_source)
     except SyntaxError:
         return []
+    # Resolve the importing file's dotted package for relative import handling.
+    importing_pkg_parts: list[str] = []
+    if importing_rel_path:
+        mod = _rel_path_to_module(importing_rel_path)
+        if mod:
+            importing_pkg_parts = mod.split(".")[:-1]
+
     mods: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mods.add(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            mods.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                if node.module:
+                    mods.add(node.module)
+            elif importing_pkg_parts:
+                # Relative import: go up `level-1` from the importing package.
+                drop = node.level - 1
+                if drop < len(importing_pkg_parts) or drop == 0:
+                    anchor = (
+                        importing_pkg_parts
+                        if drop == 0
+                        else importing_pkg_parts[:-drop]
+                    )
+                    parts = list(anchor)
+                    if node.module:
+                        parts.extend(node.module.split("."))
+                    if parts:
+                        mods.add(".".join(parts))
+
     paths: list[str] = []
     for mod in mods:
         rel = mod.replace(".", "/")
-        candidate = repo_root / f"{rel}.py"
-        if candidate.exists():
-            paths.append(candidate.relative_to(repo_root).as_posix())
-            continue
-        pkg_init = repo_root / rel / "__init__.py"
-        if pkg_init.exists():
-            paths.append(pkg_init.relative_to(repo_root).as_posix())
+        for pkg_root in _PACKAGE_ROOT_CANDIDATES:
+            base = repo_root / pkg_root if pkg_root else repo_root
+            candidate = base / f"{rel}.py"
+            if candidate.is_file():
+                paths.append(candidate.relative_to(repo_root).as_posix())
+                break
+            pkg_init = base / rel / "__init__.py"
+            if pkg_init.is_file():
+                paths.append(pkg_init.relative_to(repo_root).as_posix())
+                break
     return paths
 
 
@@ -85,10 +117,28 @@ def grep_refs(repo: Path, symbol: str) -> list[str]:
     return [l for l in out.splitlines() if l.strip()]
 
 
-def read_file(repo: Path, rel_path: str) -> str | None:
+def is_safe_rel_path(repo: Path, rel_path: str) -> bool:
+    """Reject absolute paths and paths that escape the repo via `..`."""
+    if not rel_path or rel_path.startswith("/"):
+        return False
     try:
-        return (repo / rel_path).read_text()
-    except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
+        resolved = (repo / rel_path).resolve()
+        repo_resolved = repo.resolve()
+    except (ValueError, OSError):
+        return False
+    try:
+        resolved.relative_to(repo_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def read_file(repo: Path, rel_path: str) -> str | None:
+    if not is_safe_rel_path(repo, rel_path):
+        return None
+    try:
+        return (repo / rel_path).read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
         return None
 
 
@@ -105,26 +155,54 @@ def file_history(repo: Path, rel_path: str, n: int = 5) -> str:
 def _rel_path_to_module(rel_path: str) -> str | None:
     if not rel_path.endswith(".py"):
         return None
-    mod = rel_path[:-3].replace("/", ".")
+    stripped = rel_path
+    for pkg_root in _PACKAGE_ROOT_CANDIDATES:
+        if not pkg_root:
+            continue
+        prefix = pkg_root + "/"
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    mod = stripped[:-3].replace("/", ".")
     if mod.endswith(".__init__"):
         mod = mod[: -len(".__init__")]
     return mod or None
 
 
-def _imported_modules(py_source: str) -> set[str]:
+def _imported_modules(py_source: str, importing_rel_path: str | None = None) -> set[str]:
     try:
         tree = ast.parse(py_source)
     except SyntaxError:
         return set()
+    importing_pkg_parts: list[str] = []
+    if importing_rel_path:
+        mod = _rel_path_to_module(importing_rel_path)
+        if mod:
+            importing_pkg_parts = mod.split(".")[:-1]
     mods: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mods.add(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            mods.add(node.module)
-            for alias in node.names:
-                mods.add(f"{node.module}.{alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                mods.add(node.module)
+                for alias in node.names:
+                    mods.add(f"{node.module}.{alias.name}")
+            elif node.level > 0 and importing_pkg_parts:
+                drop = node.level - 1
+                if drop < len(importing_pkg_parts) or drop == 0:
+                    anchor = (
+                        importing_pkg_parts if drop == 0 else importing_pkg_parts[:-drop]
+                    )
+                    parts = list(anchor)
+                    if node.module:
+                        parts.extend(node.module.split("."))
+                    if parts:
+                        base = ".".join(parts)
+                        mods.add(base)
+                        for alias in node.names:
+                            mods.add(f"{base}.{alias.name}")
     return mods
 
 
@@ -146,7 +224,7 @@ def build_test_import_index(
         src = read_file(repo, f)
         if src is None:
             continue
-        index[f] = _imported_modules(src)
+        index[f] = _imported_modules(src, importing_rel_path=f)
     return index
 
 
@@ -374,7 +452,7 @@ def build_payload(
         src = read_file(repo, path)
         if src is None:
             continue
-        for imp_path in parse_imports(src, repo):
+        for imp_path in parse_imports(src, repo, importing_rel_path=path):
             add(1, "IMPORT OF TOUCHED", imp_path, read_file(repo, imp_path))
 
     for sym in extract_changed_symbols(diff):
@@ -400,30 +478,40 @@ def build_payload(
         reason = entry.get("reason", "unspecified")
         add(0, f"CLAUDE-FLAGGED (reason: {reason})", path, read_file(repo, path))
 
-    tree = "\n".join(all_files)
-    header_parts = [
-        f"=== REPO: {repo.name} ===",
-        f"=== TREE ===\n{tree}",
-    ]
-    for doc in ("CLAUDE.md", "README.md"):
-        if (content := read_file(repo, doc)):
-            header_parts.append(f"=== {doc} ===\n{content}")
+    # Essential header: repo name + the thing being reviewed. Never dropped.
+    essential_parts = [f"=== REPO: {repo.name} ==="]
     if narrative:
-        header_parts.append(
+        essential_parts.append(
             f"=== COMMIT NARRATIVE ({base_ref}..{head_ref}, oldest first) ===\n{narrative}"
         )
     else:
-        header_parts.append(f"=== DIFF ({base_ref}...{head_ref}) ===\n{diff}")
-    header = "\n\n".join(header_parts)
+        essential_parts.append(f"=== DIFF ({base_ref}...{head_ref}) ===\n{diff}")
 
-    used = count_tokens(header)
+    # Optional header items, priority-ordered. CLAUDE.md before README before tree.
+    optional_header: list[tuple[str, str]] = []
+    for doc in ("CLAUDE.md", "README.md"):
+        if (content := read_file(repo, doc)):
+            optional_header.append((doc, f"=== {doc} ===\n{content}"))
+    optional_header.append(("TREE", f"=== TREE ===\n" + "\n".join(all_files)))
+
+    used = sum(count_tokens(p) for p in essential_parts)
+    dropped: list[tuple[str, str, int]] = []
+    header_parts = list(essential_parts)
+
+    for label, block in optional_header:
+        cost = count_tokens(block)
+        if used + cost <= token_budget:
+            header_parts.append(block)
+            used += cost
+        else:
+            dropped.append(("HEADER", label, cost))
+
     sections.sort(key=lambda s: s[0])
     body_parts: list[str] = []
-    dropped: list[tuple[str, str, int]] = []
     for prio, label, path, content in sections:
         block = f"=== {label}: {path} ===\n{content}"
         cost = count_tokens(block)
-        if prio == 0 or used + cost <= token_budget:
+        if used + cost <= token_budget:
             body_parts.append(block)
             used += cost
         else:
@@ -435,4 +523,5 @@ def build_payload(
         )
         body_parts.append(note)
 
+    header = "\n\n".join(header_parts)
     return header + "\n\n" + "\n\n".join(body_parts)
