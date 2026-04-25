@@ -11,7 +11,7 @@ import re
 
 from .payload import build_payload, build_scout_payload
 
-# gpt-5.4 standard context: 272K tokens. 1M opt-in tier costs 2x input above
+# gpt-5.5 standard context: 272K tokens. 1M opt-in tier costs 2x input above
 # 272K, so we stay under. Reserve ~22K for the model's response + reasoning.
 MODEL_CONTEXT_STANDARD = 272_000
 OUTPUT_RESERVE = 22_000
@@ -213,7 +213,7 @@ def _parse_scout_response(raw: str) -> list[str]:
 
 def _gpt(system_prompt: str, user_content: str) -> str:
     client = OpenAI()
-    model = os.environ.get("PARANOIA_MODEL", "gpt-5.4")
+    model = os.environ.get("PARANOIA_MODEL", "gpt-5.5")
     try:
         resp = client.responses.create(
             model=model,
@@ -232,7 +232,7 @@ def _validate_token_budget(value: object) -> int:
         raise ValueError(f"token_budget must be >= 1000, got {value}")
     if value > MODEL_CONTEXT_STANDARD:
         raise ValueError(
-            f"token_budget {value} exceeds gpt-5.4 standard context ({MODEL_CONTEXT_STANDARD}). "
+            f"token_budget {value} exceeds gpt-5.5 standard context ({MODEL_CONTEXT_STANDARD}). "
             f"Using the 1M extended tier requires extra API params not configured here."
         )
     return value

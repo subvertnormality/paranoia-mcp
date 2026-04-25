@@ -1,6 +1,6 @@
 # Paranoia
 
-An MCP server that gets a second, adversarial opinion on your code changes and plans from ChatGPT (GPT-5.4).
+An MCP server that gets a second, adversarial opinion on your code changes and plans from ChatGPT (GPT-5.5).
 
 ## What it does
 
@@ -36,14 +36,14 @@ For `critique_branch`, the server assembles a payload in layers. Each layer is l
 **Priority 2 (dropped first if over budget):**
 - Files containing references to new/changed symbols, via `git grep -w`
 
-**Optional deep mode** (`deep: true`) — runs a scouting pass first: sends a lightweight payload (tree, docs, narrative, touched-file summary) to GPT-5.4 and asks it to list up to 15 additional files it wants to see. Those files are merged into the critique payload. Costs roughly 2x tokens; improves context relevance for non-trivial diffs.
+**Optional deep mode** (`deep: true`) — runs a scouting pass first: sends a lightweight payload (tree, docs, narrative, touched-file summary) to GPT-5.5 and asks it to list up to 15 additional files it wants to see. Those files are merged into the critique payload. Costs roughly 2x tokens; improves context relevance for non-trivial diffs.
 
 The critic receives author-stated context (project summary and diff intent) framed as claims to verify, not facts to accept. Anti-padding rules in the system prompt prevent the critic from opening with preamble or generic praise.
 
 ## Prerequisites
 
 - Python 3.11+
-- An OpenAI API key with access to GPT-5.4 (either `Chat completions` or `Responses` endpoint scope — the server uses `/v1/responses`)
+- An OpenAI API key with access to GPT-5.5 (either `Chat completions` or `Responses` endpoint scope — the server uses `/v1/responses`)
 - `git` on `PATH`
 
 ## Install
@@ -69,8 +69,8 @@ Optional env vars:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PARANOIA_MODEL` | `gpt-5.4` | Which OpenAI model to call |
-| `PARANOIA_TOKEN_BUDGET` | `250000` | Input token budget (gpt-5.4 standard context is 272K; leave ~22K for response + reasoning) |
+| `PARANOIA_MODEL` | `gpt-5.5` | Which OpenAI model to call |
+| `PARANOIA_TOKEN_BUDGET` | `250000` | Input token budget (gpt-5.5 standard context is 272K; leave ~22K for response + reasoning) |
 
 ## Wire into Claude Code
 
