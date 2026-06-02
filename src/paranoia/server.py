@@ -9,7 +9,12 @@ from openai import OpenAI
 import json
 import re
 
-from .payload import build_payload, build_scout_payload
+from .payload import (
+    build_payload,
+    build_plan_payload,
+    build_plan_scout_payload,
+    build_scout_payload,
+)
 
 # gpt-5.5 standard context: 272K tokens. 1M opt-in tier costs 2x input above
 # 272K, so we stay under. Reserve ~22K for the model's response + reasoning.
@@ -69,7 +74,10 @@ Skip files already listed as touched — those are already in the payload.
 
 PLAN_SYSTEM_PROMPT = """You are Paranoia, an adversarial plan reviewer. Assume the plan you are shown will fail in ways the author hasn't considered.
 
+You may also be given a REPOSITORY CONTEXT section (repo tree, project docs, and specific files). When present, it is the ground truth for how the system ACTUALLY works today. Use it to test the plan's premises: a plan that assumes behaviour the code contradicts is the most dangerous kind of plan. If the plan asserts "X currently does Y" and a provided file shows otherwise, that is a top-severity finding. If a claim depends on code you were NOT given, say so explicitly rather than guessing.
+
 Find:
+- premises about current behaviour that the provided code contradicts
 - hidden assumptions treated as facts
 - unstated dependencies (on people, systems, data, timing)
 - failure modes and what happens when each step doesn't go to plan
@@ -81,10 +89,23 @@ Find:
 - alternatives the author didn't consider and why they were rejected (or weren't)
 
 Rules:
-- Quote the specific claim or step you are attacking.
+- Quote the specific claim or step you are attacking. When the repo contradicts it, quote the file path and offending lines too.
 - No praise. No hedging. No "overall the plan is solid" preamble.
 - If the plan is genuinely sound, say so in one sentence and stop.
 - Order findings by severity: things that kill the plan first, nitpicks last.
+"""
+
+
+PLAN_SCOUT_SYSTEM_PROMPT = """You are the scouting pass for an adversarial PLAN review. You are NOT reviewing yet.
+
+Read the repo tree, project docs, optional context, and the plan. Identify up to 15 files (repo-relative paths) you want to see in the full critique so you can judge whether the plan is grounded in how the code ACTUALLY works. Pick files likely to expose:
+- premises the plan makes about current behaviour that the code might contradict
+- the modules/functions the plan proposes to change, call, or depend on
+- configs, fixtures, or tests whose existing shape the plan's success depends on
+- prior patterns the plan should conform to (or is suspiciously diverging from)
+
+Output ONLY a JSON array of path strings. No prose, no markdown fences, no explanation. Example:
+["src/auth/middleware.py", "config/database.yml", "tests/test_login_flow.py"]
 """
 
 server: Server = Server("paranoia")
@@ -189,6 +210,45 @@ async def list_tools() -> list[Tool]:
                             "anything the critic needs to judge the plan fairly."
                         ),
                     },
+                    "repo_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional absolute path to the git repository the plan concerns. "
+                            "When provided, the critic also receives the repo tree, project docs, "
+                            "and the files listed in `files` (plus any it asks for when `deep` is "
+                            "set) so it can test the plan's premises against how the code ACTUALLY "
+                            "works — not just the plan text. Strongly recommended for plans that "
+                            "make claims about current system behaviour."
+                        ),
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": (
+                            "Files (repo-relative paths) to ground the critique — the modules the "
+                            "plan changes or depends on, configs it assumes, tests it must not "
+                            "break. Each requires a reason. Only used when `repo_path` is set."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["path", "reason"],
+                        },
+                        "default": [],
+                    },
+                    "deep": {
+                        "type": "boolean",
+                        "description": (
+                            "If true (and `repo_path` is set), run a scouting pass first: show the "
+                            "critic the tree + plan and let it name the files it needs, then include "
+                            "them. Costs ~2x tokens but catches files the author didn't think to "
+                            "flag. Default false."
+                        ),
+                        "default": False,
+                    },
+                    "token_budget": {"type": "integer", "default": DEFAULT_INPUT_BUDGET},
                 },
             },
         ),
@@ -311,9 +371,49 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     type="text",
                     text=f"[paranoia error] cannot read plan_path: {type(exc).__name__}: {exc}",
                 )]
+        context = arguments.get("context")
         user_content = f"=== PLAN ===\n{plan_text}"
-        if ctx := arguments.get("context"):
-            user_content = f"=== CONTEXT ===\n{ctx}\n\n{user_content}"
+        if context:
+            user_content = f"=== CONTEXT ===\n{context}\n\n{user_content}"
+
+        # Optional repo grounding — give the plan critic the actual code so it
+        # can test the plan's premises, not just the plan's prose. Without this
+        # the critic only ever sees the plan text (the limitation this adds onto).
+        repo_path = arguments.get("repo_path")
+        if repo_path:
+            files = list(arguments.get("files", []))
+            token_budget = _validate_token_budget(
+                arguments.get("token_budget", DEFAULT_INPUT_BUDGET)
+            )
+
+            if arguments.get("deep"):
+                try:
+                    scout_payload = build_plan_scout_payload(repo_path, plan_text, context)
+                except Exception as exc:
+                    return [TextContent(
+                        type="text",
+                        text=f"[paranoia error] plan scout payload build failed: {type(exc).__name__}: {exc}",
+                    )]
+                scout_raw = await asyncio.to_thread(_gpt, PLAN_SCOUT_SYSTEM_PROMPT, scout_payload)
+                scout_paths = _parse_scout_response(scout_raw)
+                existing = {e["path"] for e in files}
+                for p in scout_paths:
+                    if p not in existing:
+                        files.append({"path": p, "reason": "scouting pass"})
+
+            try:
+                repo_payload = build_plan_payload(
+                    repo_path=repo_path,
+                    files=files,
+                    token_budget=token_budget,
+                )
+            except Exception as exc:
+                return [TextContent(
+                    type="text",
+                    text=f"[paranoia error] plan repo payload build failed: {type(exc).__name__}: {exc}",
+                )]
+            user_content = f"{user_content}\n\n=== REPOSITORY CONTEXT ===\n{repo_payload}"
+
         result = await asyncio.to_thread(_gpt, PLAN_SYSTEM_PROMPT, user_content)
         return [TextContent(type="text", text=result)]
 

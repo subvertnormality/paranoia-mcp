@@ -407,6 +407,101 @@ def build_scout_payload(repo_path: str, base_ref: str, head_ref: str) -> str:
     return "\n\n".join(parts)
 
 
+def build_plan_scout_payload(
+    repo_path: str, plan_text: str, context: str | None = None
+) -> str:
+    """Lightweight payload for the plan scouting pass. Gives the critic the
+    repo tree, project docs, optional context, and the plan itself so it can
+    name which files it needs to judge whether the plan is grounded in how the
+    code actually works. Unlike the branch scout there is no diff — a plan
+    names the code it concerns, it hasn't changed it yet."""
+    repo = Path(repo_path).resolve()
+    all_files = [l for l in _run(["git", "ls-files"], repo).splitlines() if l.strip()]
+    parts = [
+        f"=== REPO: {repo.name} ===",
+        "=== TREE ===\n" + "\n".join(all_files),
+    ]
+    for doc in ("CLAUDE.md", "README.md"):
+        if (content := read_file(repo, doc)):
+            parts.append(f"=== {doc} ===\n{content}")
+    if context:
+        parts.append(f"=== CONTEXT ===\n{context}")
+    parts.append(f"=== PLAN ===\n{plan_text}")
+    return "\n\n".join(parts)
+
+
+def build_plan_payload(
+    repo_path: str,
+    files: list[dict],
+    token_budget: int,
+) -> str:
+    """Repo-grounding payload for plan critique: repo tree + project docs +
+    the explicitly-requested files, budget-trimmed.
+
+    Mirrors :func:`build_payload`'s header/budget handling but has no
+    diff/touched-file/import machinery — a plan doesn't have a diff. The
+    files come from the caller (author-flagged + anything the scout asked
+    for), each with a reason, the same shape as ``extra_files``."""
+    repo = Path(repo_path).resolve()
+    all_files = [l for l in _run(["git", "ls-files"], repo).splitlines() if l.strip()]
+
+    # (label, path, content) requested-file body sections.
+    body_sections: list[tuple[str, str, str]] = []
+    included: set[str] = set()
+    for entry in files:
+        path = entry["path"]
+        reason = entry.get("reason", "unspecified")
+        if path in included:
+            continue
+        content = read_file(repo, path)
+        if content is None:
+            continue
+        included.add(path)
+        body_sections.append((f"REQUESTED FILE (reason: {reason})", path, content))
+
+    # Essential header: repo name. Never dropped.
+    essential_parts = [f"=== REPO: {repo.name} ==="]
+
+    # Optional header items, priority-ordered: CLAUDE.md, README, then tree.
+    optional_header: list[tuple[str, str]] = []
+    for doc in ("CLAUDE.md", "README.md"):
+        if (content := read_file(repo, doc)):
+            optional_header.append((doc, f"=== {doc} ===\n{content}"))
+    optional_header.append(("TREE", "=== TREE ===\n" + "\n".join(all_files)))
+
+    used = sum(count_tokens(p) for p in essential_parts)
+    header_parts = list(essential_parts)
+    dropped: list[tuple[str, str, int]] = []
+    for label, block in optional_header:
+        cost = count_tokens(block)
+        if used + cost <= token_budget:
+            header_parts.append(block)
+            used += cost
+        else:
+            dropped.append(("HEADER", label, cost))
+
+    body_parts: list[str] = []
+    for label, path, content in body_sections:
+        block = f"=== {label}: {path} ===\n{content}"
+        cost = count_tokens(block)
+        if used + cost <= token_budget:
+            body_parts.append(block)
+            used += cost
+        else:
+            dropped.append((label, path, cost))
+
+    if dropped:
+        note = "=== DROPPED (over budget) ===\n" + "\n".join(
+            f"- [{label}] {path} ({cost} tokens)" for label, path, cost in dropped
+        )
+        body_parts.append(note)
+
+    header = "\n\n".join(header_parts)
+    if not body_parts:
+        return header
+    return header + "\n\n" + "\n\n".join(body_parts)
+
+
 def build_payload(
     repo_path: str,
     base_ref: str,

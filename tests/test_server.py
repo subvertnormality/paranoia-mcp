@@ -74,3 +74,81 @@ class TestCritiquePlanValidation:
         from paranoia.server import call_tool
         with pytest.raises(ValueError, match="requires plan_text or plan_path"):
             await call_tool("critique_plan", {})
+
+
+class TestCritiquePlanRepoGrounding:
+    @pytest.mark.asyncio
+    async def test_no_repo_path_sends_plan_only(self, monkeypatch) -> None:
+        """Backward compat: without repo_path the critic still gets only the
+        plan (+context), no REPOSITORY CONTEXT section."""
+        from paranoia import server
+
+        captured: dict[str, str] = {}
+
+        def fake_gpt(system: str, user: str) -> str:
+            captured["user"] = user
+            return "ok"
+
+        monkeypatch.setattr(server, "_gpt", fake_gpt)
+        await server.call_tool("critique_plan", {"plan_text": "do the thing"})
+        assert "=== PLAN ===" in captured["user"]
+        assert "REPOSITORY CONTEXT" not in captured["user"]
+
+    @pytest.mark.asyncio
+    async def test_repo_path_sends_actual_code(self, flat_repo, monkeypatch) -> None:
+        """The core fix: with repo_path + files, the plan critic receives the
+        real source, not just the plan text."""
+        from paranoia import server
+
+        captured: dict[str, str] = {}
+
+        def fake_gpt(system: str, user: str) -> str:
+            captured["user"] = user
+            return "ok"
+
+        monkeypatch.setattr(server, "_gpt", fake_gpt)
+        await server.call_tool("critique_plan", {
+            "plan_text": "Change do_thing to return 0",
+            "repo_path": str(flat_repo),
+            "files": [{"path": "helpers.py", "reason": "the function being changed"}],
+        })
+        assert "=== REPOSITORY CONTEXT ===" in captured["user"]
+        assert "=== TREE ===" in captured["user"]
+        assert "def do_thing" in captured["user"]  # actual code reached the critic
+
+    @pytest.mark.asyncio
+    async def test_deep_scout_pulls_in_files(self, flat_repo, monkeypatch) -> None:
+        """deep=True runs a scouting pass; files the scout names are included
+        even when the author flagged none."""
+        from paranoia import server
+
+        calls: list[str] = []
+        captured: dict[str, str] = {}
+
+        def fake_gpt(system: str, user: str) -> str:
+            calls.append(system)
+            if "scouting pass" in system or "NOT reviewing yet" in system:
+                return '["helpers.py"]'
+            captured["user"] = user
+            return "ok"
+
+        monkeypatch.setattr(server, "_gpt", fake_gpt)
+        await server.call_tool("critique_plan", {
+            "plan_text": "Change do_thing",
+            "repo_path": str(flat_repo),
+            "deep": True,
+        })
+        # Two model calls: the scout, then the review.
+        assert len(calls) == 2
+        assert "def do_thing" in captured["user"]
+
+    @pytest.mark.asyncio
+    async def test_bad_repo_path_returns_error_not_raises(self, monkeypatch) -> None:
+        from paranoia import server
+
+        monkeypatch.setattr(server, "_gpt", lambda s, u: "ok")
+        result = await server.call_tool("critique_plan", {
+            "plan_text": "x",
+            "repo_path": "/nonexistent/repo/path",
+        })
+        assert "[paranoia error]" in result[0].text
