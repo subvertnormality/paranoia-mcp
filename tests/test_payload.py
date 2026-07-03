@@ -6,6 +6,8 @@ from paranoia.payload import (
     _imported_modules,
     _rel_path_to_module,
     build_payload,
+    build_plan_payload,
+    build_plan_scout_payload,
     build_test_import_index,
     count_tokens,
     find_tests_for,
@@ -116,6 +118,88 @@ class TestBudgetEnforcement:
         )
         assert "DROPPED" not in payload
         assert count_tokens(payload) < 50000
+
+
+class TestBuildPlanPayload:
+    def test_includes_tree_and_requested_file(self, flat_repo: Path) -> None:
+        payload = build_plan_payload(
+            repo_path=str(flat_repo),
+            files=[{"path": "helpers.py", "reason": "the function the plan changes"}],
+            token_budget=50000,
+        )
+        assert "=== TREE ===" in payload
+        assert "helpers.py" in payload
+        # The actual code, not just the path, must reach the critic.
+        assert "def do_thing" in payload
+        assert "the function the plan changes" in payload
+
+    def test_no_files_still_grounds_with_tree(self, flat_repo: Path) -> None:
+        payload = build_plan_payload(
+            repo_path=str(flat_repo), files=[], token_budget=50000
+        )
+        assert "=== REPO: flat ===" in payload
+        assert "=== TREE ===" in payload
+        assert "DROPPED" not in payload
+
+    def test_unsafe_path_skipped(self, flat_repo: Path) -> None:
+        payload = build_plan_payload(
+            repo_path=str(flat_repo),
+            files=[{"path": "../../etc/passwd", "reason": "malicious"}],
+            token_budget=50000,
+        )
+        # read_file returns None for unsafe paths -> section silently omitted.
+        assert "passwd" not in payload
+        assert "=== TREE ===" in payload
+
+    def test_missing_file_skipped(self, flat_repo: Path) -> None:
+        payload = build_plan_payload(
+            repo_path=str(flat_repo),
+            files=[{"path": "does_not_exist.py", "reason": "typo"}],
+            token_budget=50000,
+        )
+        assert "does_not_exist.py" not in payload
+
+    def test_duplicate_files_included_once(self, flat_repo: Path) -> None:
+        payload = build_plan_payload(
+            repo_path=str(flat_repo),
+            files=[
+                {"path": "helpers.py", "reason": "first"},
+                {"path": "helpers.py", "reason": "second"},
+            ],
+            token_budget=50000,
+        )
+        assert payload.count("REQUESTED FILE") == 1
+
+    def test_over_budget_drops_with_note(self, flat_repo: Path) -> None:
+        big = flat_repo / "big.py"
+        big.write_text('"""big"""\n' + ("x = 1  # filler\n" * 500))
+        payload = build_plan_payload(
+            repo_path=str(flat_repo),
+            files=[{"path": "big.py", "reason": "huge"}],
+            token_budget=1500,
+        )
+        assert "DROPPED" in payload
+        assert "big.py" in payload.split("=== DROPPED")[-1]
+
+
+class TestBuildPlanScoutPayload:
+    def test_includes_tree_and_plan(self, flat_repo: Path) -> None:
+        payload = build_plan_scout_payload(
+            repo_path=str(flat_repo),
+            plan_text="Refactor do_thing to return 0",
+            context="background here",
+        )
+        assert "=== TREE ===" in payload
+        assert "helpers.py" in payload
+        assert "Refactor do_thing" in payload
+        assert "background here" in payload
+
+    def test_context_optional(self, flat_repo: Path) -> None:
+        payload = build_plan_scout_payload(
+            repo_path=str(flat_repo), plan_text="some plan"
+        )
+        assert "=== CONTEXT ===" not in payload
+        assert "some plan" in payload
 
 
 class TestRelativeImportResolution:

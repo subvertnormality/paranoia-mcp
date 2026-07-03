@@ -109,8 +109,14 @@ Returns the critic's five-section review: `## What works`, `## What doesn't work
 | `plan_text` | string | one of these | Plan content as markdown |
 | `plan_path` | string | one of these | Absolute path to a markdown plan file |
 | `context` | string | no | Background the critic needs to judge the plan fairly |
+| `repo_path` | string | no | Absolute path to the git repo the plan concerns. When set, the critic also receives the repo tree, project docs, and `files` so it can test the plan against how the code actually works |
+| `files` | array | no | `{path, reason}` entries — the modules the plan changes/depends on, configs it assumes, tests it must not break. Only used with `repo_path` |
+| `deep` | boolean | no | With `repo_path`, run a scouting pass first: show the critic the tree + plan and let it name files it needs, then include them (~2x tokens). Default false |
+| `token_budget` | integer | no | Input-token budget for the repo grounding payload |
 
 Returns a plan-focused critique: hidden assumptions, unstated dependencies, failure modes, missing rollback, ordering errors, scope creep.
+
+By default the plan critic sees **only the plan text** (plus `context`). For plans that assert how the current system behaves, pass `repo_path` (and the relevant `files`, or `deep: true`) so the critic can catch premises the code contradicts — the most dangerous kind of plan error — rather than taking the plan's claims on trust.
 
 ## Example
 
